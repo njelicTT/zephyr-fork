@@ -2112,6 +2112,51 @@ static void i3c_stm32_isr_controller_ibi(const struct device *dev)
 #endif /* CONFIG_I3C_USE_IBI */
 #endif /* CONFIG_I3C_CONTROLLER */
 
+#ifdef CONFIG_I3C_TARGET
+/* Drop the armed reply. Unsent bytes left in the TX FIFO, or a preload still armed, would
+ * otherwise be returned first by the next private read, or make the next target_tx_write() fail
+ * with -EBUSY.
+ */
+static void i3c_stm32_target_tx_abort(const struct device *dev)
+{
+	const struct i3c_stm32_config *config = dev->config;
+	struct i3c_stm32_data *data = dev->data;
+	I3C_TypeDef *i3c = config->i3c;
+
+	LL_I3C_DisableIT_TXFNF(i3c);
+	LL_I3C_RequestTxFIFOFlush(i3c);
+	data->target_tx_buf = NULL;
+	data->target_tx_preloaded = false;
+	data->target_tx_remaining = 0U;
+	data->target_tx_len = 0U;
+}
+
+/* A frame completed in target mode */
+static void i3c_stm32_target_frame_complete(const struct device *dev)
+{
+	const struct i3c_stm32_config *config = dev->config;
+	struct i3c_stm32_data *data = dev->data;
+	I3C_TypeDef *i3c = config->i3c;
+
+	if (data->target_tx_len != 0U &&
+	    LL_I3C_GetMessageDirection(i3c) == LL_I3C_MESSAGE_DIRECTION_READ) {
+		/* The read can end before the whole reply went out: the controller stopped it, or
+		 * the TX FIFO ran dry. Drop the rest, as the ST HAL does for HAL_I3C_ERROR_SIZE.
+		 */
+		if (LL_I3C_GetXferDataCount(i3c) != data->target_tx_len ||
+		    LL_I3C_IsActiveTxPreload(i3c)) {
+			i3c_stm32_target_tx_abort(dev);
+		}
+		data->target_tx_len = 0U;
+	}
+
+	if (data->target_config != NULL && data->target_config->callbacks != NULL &&
+	    data->target_config->callbacks->stop_cb != NULL) {
+		data->target_config->callbacks->stop_cb(data->target_config);
+	}
+}
+#endif /* CONFIG_I3C_TARGET */
+
 /* Handles the I3C event ISR */
 static void i3c_stm32_event_isr(void *arg)
 {
@@ -2178,11 +2223,8 @@ static void i3c_stm32_event_isr(void *arg)
 		data->msg_state = STM32_I3C_MSG_IDLE;
 
 #ifdef CONFIG_I3C_TARGET
-		if (!ll_i3c_is_in_controller_mode(i3c) &&
-		    data->target_config != NULL &&
-		    data->target_config->callbacks != NULL &&
-		    data->target_config->callbacks->stop_cb != NULL) {
-			data->target_config->callbacks->stop_cb(data->target_config);
+		if (!ll_i3c_is_in_controller_mode(i3c)) {
+			i3c_stm32_target_frame_complete(dev);
 		}
 #endif /*CONFIG_I3C_TARGET*/
 	}
@@ -2230,6 +2272,22 @@ static int i3c_stm32_error(void *arg)
 #endif /* CONFIG_I3C_STM32_COMBINED_INTERRUPT */
 
 	i3c_stm32_log_err_type(dev);
+
+#ifdef CONFIG_I3C_TARGET
+	if (!ll_i3c_is_in_controller_mode(i3c)) {
+		/* A target error (e.g. a TX underrun, SER.DOVR) aborts the private read: drop the
+		 * rest of the reply and release it, the controller retries at its own level.
+		 */
+		if (data->target_tx_len != 0U || LL_I3C_IsActiveTxPreload(i3c)) {
+			i3c_stm32_target_tx_abort(dev);
+			if (data->target_config != NULL &&
+			    data->target_config->callbacks != NULL &&
+			    data->target_config->callbacks->stop_cb != NULL) {
+				data->target_config->callbacks->stop_cb(data->target_config);
+			}
+		}
+	}
+#endif /* CONFIG_I3C_TARGET */
 
 	LL_I3C_ClearFlag_ERR(i3c);
 
@@ -2584,6 +2642,19 @@ static int i3c_stm32_target_tx_write(const struct device *dev, uint8_t *buf, uin
 
 	if (buf == NULL && data->target_config->callbacks->read_processed_cb == NULL) {
 		return -ENOSYS;
+	}
+
+	/* A reply is still armed: the controller never read it (lost IBI, controller gone) and its
+	 * sender gave up on it, target TX being serialised by the caller. Drop it, or every later
+	 * reply fails with -EBUSY. Should the controller be reading it right now, that read
+	 * completes short and frame complete flushes what is left.
+	 */
+	if (data->target_tx_len != 0U || LL_I3C_IsActiveTxPreload(i3c)) {
+		unsigned int key = irq_lock();
+
+		i3c_stm32_target_tx_abort(dev);
+		irq_unlock(key);
+		LOG_WRN("Dropped an unread target reply");
 	}
 
 	if (LL_I3C_IsActiveTxPreload(i3c)) {
