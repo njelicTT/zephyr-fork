@@ -2884,7 +2884,6 @@ static int i3c_stm32_target_tx_write(const struct device *dev, uint8_t *buf, uin
 
 	if (LL_I3C_IsActiveTxPreload(i3c)) {
 		LOG_ERR("Target preload in progress");
-		k_mutex_unlock(&data->bus_mutex);
 		return -EBUSY;
 	}
 
@@ -2905,7 +2904,6 @@ static int i3c_stm32_target_tx_write(const struct device *dev, uint8_t *buf, uin
 			LL_I3C_RequestTxFIFOFlush(i3c);
 			data->target_tx_len = 0U;
 		}
-		k_mutex_unlock(&data->bus_mutex);
 		return ret;
 	}
 #endif /* CONFIG_I3C_STM32_DMA */
@@ -2915,7 +2913,6 @@ static int i3c_stm32_target_tx_write(const struct device *dev, uint8_t *buf, uin
 	LL_I3C_ConfigTxPreload(i3c, len);
 	LL_I3C_EnableIT_TXFNF(i3c);
 
-	k_mutex_unlock(&data->bus_mutex);
 	return 0; /* we process 0 bytes here, and let the interrupt drive all bytes through */
 }
 
