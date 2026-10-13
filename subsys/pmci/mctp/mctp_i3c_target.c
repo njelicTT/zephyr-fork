@@ -17,43 +17,24 @@ void mctp_i3c_target_buf_write(struct i3c_target_config *config, uint8_t *val, u
 {
 	struct mctp_binding_i3c_target *b =
 		CONTAINER_OF(config, struct mctp_binding_i3c_target, i3c_target_cfg);
-	struct i3c_config_target cfg;
 
 	LOG_DBG("I3C Target buffer write received, len=%d", len);
 
-	/* Get dynamic address if not yet retrieved */
-	if (b->dynamic_addr == 0) {
-		if (i3c_config_get_target(b->i3c, &cfg) == 0) {
-			b->dynamic_addr = cfg.dynamic_addr;
-			LOG_DBG("Target dynamic address assigned: 0x%02x", b->dynamic_addr);
-		}
+	if (b->rx_pkt != NULL) {
+		/* Left over from a write that never completed */
+		mctp_pktbuf_free(b->rx_pkt);
 	}
 
-	/* PEC verification as per DSP0233 1.0.0: CRC-8 seeded with the address byte
-	 * (dynamic_addr << 1 | W), computed over all received bytes except PEC.
+	/* Keep the PEC: mctp_i3c_target_rx_work() checks and strips it, as for byte-by-byte
+	 * drivers
 	 */
-	uint8_t addr_byte = b->dynamic_addr << 1U;
-
-	LOG_DBG("PEC verification: addr=0x%02x, data_len=%u, received_pec=0x%02x",
-		addr_byte, len, val[len - 1]);
-
-	if (mctp_i3c_verify_pec(val, len, addr_byte) != 0) {
-		LOG_WRN("PEC verification failed (addr: 0x%02x)", addr_byte);
-		return;
-	}
-
-	/* Strip the trailing PEC byte before allocating pktbuf */
-	size_t payload_len = len - I3C_PROTOCOL_PEC_SZ;
-
-	b->rx_pkt = mctp_pktbuf_alloc(&b->binding, payload_len);
-
+	b->rx_pkt = mctp_pktbuf_alloc(&b->binding, len);
 	if (b->rx_pkt == NULL) {
-		LOG_WRN("Could not allocate pktbuf of len %zu to receive I3C message", payload_len);
+		LOG_WRN("Could not allocate pktbuf of len %d to receive I3C message", len);
 		return;
 	}
 
-	LOG_DBG("Read %zu bytes from controller (PEC ok)", payload_len);
-	memcpy(b->rx_pkt->data, val, payload_len);
+	memcpy(b->rx_pkt->data, val, len);
 }
 
 /*
