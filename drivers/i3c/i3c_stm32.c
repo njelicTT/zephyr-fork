@@ -192,6 +192,11 @@ struct i3c_stm32_data {
 	bool target_tx_preloaded;
 	/* Bytes of that reply still to be fed */
 	uint16_t target_tx_remaining;
+	/* Length of the armed reply, until the private read that returns it completes */
+	uint16_t target_tx_len;
+	/* The armed reply, fed to the FIFO straight from the caller's buffer */
+	const uint8_t *target_tx_buf;
+	uint16_t target_tx_idx;
 #endif /*CONFIG_I3C_TARGET*/
 };
 
@@ -1777,6 +1782,21 @@ static void i3c_stm32_process_target_txfnf(const struct device *dev)
 	const struct i3c_stm32_config *config = dev->config;
 	I3C_TypeDef *i3c = config->i3c;
 
+	if (data->target_tx_buf != NULL) {
+		/* At 8 MHz a byte leaves every ~1.1 us and the FIFO holds a few: no callback here */
+		while (data->target_tx_idx < data->target_tx_len &&
+		       LL_I3C_IsActiveFlag_TXFNF(i3c)) {
+			LL_I3C_TransmitData8(i3c, data->target_tx_buf[data->target_tx_idx++]);
+		}
+		if (data->target_tx_idx >= data->target_tx_len) {
+			data->target_tx_buf = NULL;
+			data->target_tx_preloaded = false;
+			data->target_tx_remaining = 0U;
+			LL_I3C_DisableIT_TXFNF(i3c);
+		}
+		return;
+	}
+
 	while (LL_I3C_IsActiveFlag_TXFNF(i3c)) {
 
 		/* An armed reply is exactly target_tx_remaining bytes: feeding the FIFO past it
@@ -2562,7 +2582,7 @@ static int i3c_stm32_target_tx_write(const struct device *dev, uint8_t *buf, uin
 	const struct i3c_stm32_config *config = dev->config;
 	I3C_TypeDef *i3c = config->i3c;
 
-	if (data->target_config->callbacks->read_processed_cb == NULL) {
+	if (buf == NULL && data->target_config->callbacks->read_processed_cb == NULL) {
 		return -ENOSYS;
 	}
 
@@ -2573,6 +2593,9 @@ static int i3c_stm32_target_tx_write(const struct device *dev, uint8_t *buf, uin
 	}
 
 	data->target_tx_remaining = len;
+	data->target_tx_len = len;
+	data->target_tx_idx = 0U;
+	data->target_tx_buf = buf;
 	data->target_tx_preloaded = true;
 	LL_I3C_ConfigTxPreload(i3c, len);
 	LL_I3C_EnableIT_TXFNF(i3c);
