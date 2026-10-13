@@ -258,7 +258,15 @@ int mctp_i3c_target_tx(struct mctp_binding *binding, struct mctp_pktbuf *pkt)
 #else
 	ret = 0;
 #endif
-	k_sem_take(b->tx_complete, K_FOREVER);
+	if (k_sem_take(b->tx_complete, K_MSEC(CONFIG_MCTP_I3C_TARGET_TX_TIMEOUT_MS)) != 0) {
+		unsigned int key = irq_lock();
+
+		b->tx_pkt = NULL;
+		irq_unlock(key);
+		k_sem_reset(b->tx_complete);
+		LOG_WRN("I3C reply not read by the controller, dropped");
+		ret = -ETIMEDOUT;
+	}
 
 out:
 	k_sem_give(b->tx_lock);
