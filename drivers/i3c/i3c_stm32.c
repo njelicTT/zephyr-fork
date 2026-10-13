@@ -139,6 +139,11 @@ struct i3c_stm32_config {
 #endif
 };
 
+#ifdef CONFIG_I3C_TARGET_BUFFER_MODE
+/* Largest private write accepted in target buffer mode: the advertised MWL must not exceed it */
+#define STM32_I3C_TARGET_RX_BUF_SIZE 256U
+#endif /* CONFIG_I3C_TARGET_BUFFER_MODE */
+
 struct i3c_stm32_data {
 	struct i3c_driver_data drv_data;     /* I3C driver data */
 	enum i3c_stm32_msg_state msg_state;  /* Current I3C bus state */
@@ -197,6 +202,12 @@ struct i3c_stm32_data {
 	/* The armed reply, fed to the FIFO straight from the caller's buffer */
 	const uint8_t *target_tx_buf;
 	uint16_t target_tx_idx;
+#ifdef CONFIG_I3C_TARGET_BUFFER_MODE
+	/* Private write being received, handed to buf_write_received_cb at frame complete */
+	uint8_t target_rx_buf[STM32_I3C_TARGET_RX_BUF_SIZE];
+	uint16_t target_rx_len;
+	bool target_rx_overflow;
+#endif /* CONFIG_I3C_TARGET_BUFFER_MODE */
 #endif /*CONFIG_I3C_TARGET*/
 };
 
@@ -1940,6 +1951,28 @@ static void i3c_stm32_event_isr_tx(const struct device *dev)
 #endif /*CONFIG_I3C_CONTROLLER*/
 }
 
+#ifdef CONFIG_I3C_TARGET_BUFFER_MODE
+/* Drain the RX FIFO into the frame buffer. At 8 MHz a byte lands every ~1.1 us and the FIFO holds
+ * a few: no callback per byte, or longer writes overrun (SER.DOVR).
+ */
+static void i3c_stm32_target_drain_rx(const struct device *dev)
+{
+	const struct i3c_stm32_config *config = dev->config;
+	struct i3c_stm32_data *data = dev->data;
+	I3C_TypeDef *i3c = config->i3c;
+
+	while (LL_I3C_IsActiveFlag_RXFNE(i3c)) {
+		uint8_t byte = LL_I3C_ReceiveData8(i3c);
+
+		if (data->target_rx_len < sizeof(data->target_rx_buf)) {
+			data->target_rx_buf[data->target_rx_len++] = byte;
+		} else {
+			data->target_rx_overflow = true;
+		}
+	}
+}
+#endif /* CONFIG_I3C_TARGET_BUFFER_MODE */
+
 static void i3c_stm32_event_isr_rx(const struct device *dev)
 {
 	const struct i3c_stm32_config *config = dev->config;
@@ -1948,6 +1981,13 @@ static void i3c_stm32_event_isr_rx(const struct device *dev)
 
 #ifdef CONFIG_I3C_TARGET
 	if (LL_I3C_IsActiveFlag_RXFNE(i3c) && !ll_i3c_is_in_controller_mode(i3c)) {
+#ifdef CONFIG_I3C_TARGET_BUFFER_MODE
+		if (data->target_config != NULL && data->target_config->callbacks != NULL &&
+		    data->target_config->callbacks->buf_write_received_cb != NULL) {
+			i3c_stm32_target_drain_rx(dev);
+			return;
+		}
+#endif /* CONFIG_I3C_TARGET_BUFFER_MODE */
 		if (data->target_config && data->target_config->callbacks != NULL &&
 		    data->target_config->callbacks->write_requested_cb != NULL) {
 			data->target_config->callbacks->write_requested_cb(data->target_config);
@@ -2150,6 +2190,19 @@ static void i3c_stm32_target_frame_complete(const struct device *dev)
 		data->target_tx_len = 0U;
 	}
 
+#ifdef CONFIG_I3C_TARGET_BUFFER_MODE
+	/* Bytes that landed after the RX handler ran */
+	i3c_stm32_target_drain_rx(dev);
+	if (data->target_rx_len != 0U && !data->target_rx_overflow &&
+	    data->target_config != NULL && data->target_config->callbacks != NULL &&
+	    data->target_config->callbacks->buf_write_received_cb != NULL) {
+		data->target_config->callbacks->buf_write_received_cb(
+			data->target_config, data->target_rx_buf, data->target_rx_len);
+	}
+	data->target_rx_len = 0U;
+	data->target_rx_overflow = false;
+#endif /* CONFIG_I3C_TARGET_BUFFER_MODE */
+
 	if (data->target_config != NULL && data->target_config->callbacks != NULL &&
 	    data->target_config->callbacks->stop_cb != NULL) {
 		data->target_config->callbacks->stop_cb(data->target_config);
@@ -2275,6 +2328,14 @@ static int i3c_stm32_error(void *arg)
 
 #ifdef CONFIG_I3C_TARGET
 	if (!ll_i3c_is_in_controller_mode(i3c)) {
+#ifdef CONFIG_I3C_TARGET_BUFFER_MODE
+		/* An RX overrun (SER.DOVR) or a parity error aborts the private write: drop what was
+		 * received of it, or it would be prepended to the controller's retry.
+		 */
+		LL_I3C_RequestRxFIFOFlush(i3c);
+		data->target_rx_len = 0U;
+		data->target_rx_overflow = false;
+#endif /* CONFIG_I3C_TARGET_BUFFER_MODE */
 		/* A target error (e.g. a TX underrun, SER.DOVR) aborts the private read: drop the
 		 * rest of the reply and release it, the controller retries at its own level.
 		 */
