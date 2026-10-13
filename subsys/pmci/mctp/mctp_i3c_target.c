@@ -106,7 +106,10 @@ int mctp_i3c_target_stop(struct i3c_target_config *config)
 	struct mctp_binding_i3c_target *b =
 		CONTAINER_OF(config, struct mctp_binding_i3c_target, i3c_target_cfg);
 
-	if (b->tx_pkt != NULL) {
+	/* A stop ending a write (the controller's next request) is not the end of the read that
+	 * returns the pending reply: only a frame that received nothing completes it.
+	 */
+	if (b->tx_pkt != NULL && b->rx_pkt == NULL) {
 		b->tx_pkt = NULL;
 		k_sem_give(b->tx_complete);
 	}
