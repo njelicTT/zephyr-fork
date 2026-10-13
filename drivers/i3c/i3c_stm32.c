@@ -202,11 +202,19 @@ struct i3c_stm32_data {
 	/* The armed reply, fed to the FIFO straight from the caller's buffer */
 	const uint8_t *target_tx_buf;
 	uint16_t target_tx_idx;
+#ifdef CONFIG_I3C_STM32_DMA
+	/* The armed reply is fed to the TX FIFO by the "tx" DMA channel */
+	bool target_tx_dma;
+#endif /* CONFIG_I3C_STM32_DMA */
 #ifdef CONFIG_I3C_TARGET_BUFFER_MODE
 	/* Private write being received, handed to buf_write_received_cb at frame complete */
 	uint8_t target_rx_buf[STM32_I3C_TARGET_RX_BUF_SIZE];
 	uint16_t target_rx_len;
 	bool target_rx_overflow;
+#ifdef CONFIG_I3C_STM32_DMA
+	/* Private writes land in target_rx_buf by the "rx" DMA channel */
+	bool target_rx_dma;
+#endif /* CONFIG_I3C_STM32_DMA */
 #endif /* CONFIG_I3C_TARGET_BUFFER_MODE */
 #endif /*CONFIG_I3C_TARGET*/
 };
@@ -2153,6 +2161,97 @@ static void i3c_stm32_isr_controller_ibi(const struct device *dev)
 #endif /* CONFIG_I3C_CONTROLLER */
 
 #ifdef CONFIG_I3C_TARGET
+#ifdef CONFIG_I3C_STM32_DMA
+/* Feed a target reply to the TX FIFO by DMA: unlike the TXFNF interrupt, it cannot fall behind an
+ * 8 MHz private read when other interrupts or locked sections delay the CPU.
+ */
+static int i3c_stm32_target_tx_dma_start(const struct device *dev, const uint8_t *buf,
+					 uint16_t len)
+{
+	const struct i3c_stm32_config *config = dev->config;
+	struct i3c_stm32_data *data = dev->data;
+	struct i3c_stm32_dma_stream *tx = &data->dma_tx;
+	int ret;
+
+	/* The stream configs are otherwise only set up by the controller init */
+	ret = i3c_stm32_dma_stream_config(
+		dev, tx, (uint32_t)buf,
+		LL_I3C_DMA_GetRegAddr(config->i3c, LL_I3C_DMA_REG_DATA_TRANSMIT_BYTE));
+	if (ret != 0) {
+		return ret;
+	}
+	tx->blk_cfg.block_size = len;
+	ret = dma_config(tx->dma_dev, tx->dma_channel, &tx->dma_cfg);
+	if (ret == 0) {
+		ret = dma_start(tx->dma_dev, tx->dma_channel);
+	}
+	if (ret != 0) {
+		LOG_ERR("Target TX DMA start failed: %d", ret);
+		return ret;
+	}
+	data->target_tx_dma = true;
+	LL_I3C_EnableDMAReq_TX(config->i3c);
+
+	return 0;
+}
+
+static void i3c_stm32_target_tx_dma_stop(const struct device *dev)
+{
+	const struct i3c_stm32_config *config = dev->config;
+	struct i3c_stm32_data *data = dev->data;
+
+	if (data->target_tx_dma) {
+		LL_I3C_DisableDMAReq_TX(config->i3c);
+		(void)dma_stop(data->dma_tx.dma_dev, data->dma_tx.dma_channel);
+		data->target_tx_dma = false;
+	}
+}
+
+#ifdef CONFIG_I3C_TARGET_BUFFER_MODE
+/* Receive the next private write into target_rx_buf by DMA; frame complete hands it over */
+static int i3c_stm32_target_rx_dma_arm(const struct device *dev)
+{
+	const struct i3c_stm32_config *config = dev->config;
+	struct i3c_stm32_data *data = dev->data;
+	struct i3c_stm32_dma_stream *rx = &data->dma_rx;
+	int ret;
+
+	ret = i3c_stm32_dma_stream_config(
+		dev, rx, LL_I3C_DMA_GetRegAddr(config->i3c, LL_I3C_DMA_REG_DATA_RECEIVE_BYTE),
+		(uint32_t)data->target_rx_buf);
+	if (ret != 0) {
+		return ret;
+	}
+	rx->blk_cfg.block_size = sizeof(data->target_rx_buf);
+	ret = dma_config(rx->dma_dev, rx->dma_channel, &rx->dma_cfg);
+	if (ret == 0) {
+		ret = dma_start(rx->dma_dev, rx->dma_channel);
+	}
+	if (ret != 0) {
+		LOG_ERR("Target RX DMA start failed: %d", ret);
+		return ret;
+	}
+	LL_I3C_DisableIT_RXFNE(config->i3c);
+	LL_I3C_EnableDMAReq_RX(config->i3c);
+	data->target_rx_dma = true;
+
+	return 0;
+}
+
+static void i3c_stm32_target_rx_dma_disarm(const struct device *dev)
+{
+	const struct i3c_stm32_config *config = dev->config;
+	struct i3c_stm32_data *data = dev->data;
+
+	if (data->target_rx_dma) {
+		LL_I3C_DisableDMAReq_RX(config->i3c);
+		(void)dma_stop(data->dma_rx.dma_dev, data->dma_rx.dma_channel);
+		data->target_rx_dma = false;
+	}
+}
+#endif /* CONFIG_I3C_TARGET_BUFFER_MODE */
+#endif /* CONFIG_I3C_STM32_DMA */
+
 /* Drop the armed reply. Unsent bytes left in the TX FIFO, or a preload still armed, would
  * otherwise be returned first by the next private read, or make the next target_tx_write() fail
  * with -EBUSY.
@@ -2163,6 +2262,9 @@ static void i3c_stm32_target_tx_abort(const struct device *dev)
 	struct i3c_stm32_data *data = dev->data;
 	I3C_TypeDef *i3c = config->i3c;
 
+#ifdef CONFIG_I3C_STM32_DMA
+	i3c_stm32_target_tx_dma_stop(dev);
+#endif /* CONFIG_I3C_STM32_DMA */
 	LL_I3C_DisableIT_TXFNF(i3c);
 	LL_I3C_RequestTxFIFOFlush(i3c);
 	data->target_tx_buf = NULL;
@@ -2180,6 +2282,9 @@ static void i3c_stm32_target_frame_complete(const struct device *dev)
 
 	if (data->target_tx_len != 0U &&
 	    LL_I3C_GetMessageDirection(i3c) == LL_I3C_MESSAGE_DIRECTION_READ) {
+#ifdef CONFIG_I3C_STM32_DMA
+		i3c_stm32_target_tx_dma_stop(dev);
+#endif /* CONFIG_I3C_STM32_DMA */
 		/* The read can end before the whole reply went out: the controller stopped it, or
 		 * the TX FIFO ran dry. Drop the rest, as the ST HAL does for HAL_I3C_ERROR_SIZE.
 		 */
@@ -2191,6 +2296,19 @@ static void i3c_stm32_target_frame_complete(const struct device *dev)
 	}
 
 #ifdef CONFIG_I3C_TARGET_BUFFER_MODE
+#ifdef CONFIG_I3C_STM32_DMA
+	if (data->target_rx_dma &&
+	    LL_I3C_GetMessageDirection(i3c) != LL_I3C_MESSAGE_DIRECTION_READ) {
+		uint32_t got = LL_I3C_GetXferDataCount(i3c);
+
+		i3c_stm32_target_rx_dma_disarm(dev);
+		if (got > sizeof(data->target_rx_buf)) {
+			data->target_rx_overflow = true;
+		} else {
+			data->target_rx_len = (uint16_t)got;
+		}
+	}
+#endif /* CONFIG_I3C_STM32_DMA */
 	/* Bytes that landed after the RX handler ran */
 	i3c_stm32_target_drain_rx(dev);
 	if (data->target_rx_len != 0U && !data->target_rx_overflow &&
@@ -2201,6 +2319,11 @@ static void i3c_stm32_target_frame_complete(const struct device *dev)
 	}
 	data->target_rx_len = 0U;
 	data->target_rx_overflow = false;
+#ifdef CONFIG_I3C_STM32_DMA
+	if (!data->target_rx_dma && data->dma_rx.dma_dev != NULL) {
+		(void)i3c_stm32_target_rx_dma_arm(dev);
+	}
+#endif /* CONFIG_I3C_STM32_DMA */
 #endif /* CONFIG_I3C_TARGET_BUFFER_MODE */
 
 	if (data->target_config != NULL && data->target_config->callbacks != NULL &&
@@ -2332,9 +2455,17 @@ static int i3c_stm32_error(void *arg)
 		/* An RX overrun (SER.DOVR) or a parity error aborts the private write: drop what was
 		 * received of it, or it would be prepended to the controller's retry.
 		 */
+#ifdef CONFIG_I3C_STM32_DMA
+		i3c_stm32_target_rx_dma_disarm(dev);
+#endif /* CONFIG_I3C_STM32_DMA */
 		LL_I3C_RequestRxFIFOFlush(i3c);
 		data->target_rx_len = 0U;
 		data->target_rx_overflow = false;
+#ifdef CONFIG_I3C_STM32_DMA
+		if (data->dma_rx.dma_dev != NULL) {
+			(void)i3c_stm32_target_rx_dma_arm(dev);
+		}
+#endif /* CONFIG_I3C_STM32_DMA */
 #endif /* CONFIG_I3C_TARGET_BUFFER_MODE */
 		/* A target error (e.g. a TX underrun, SER.DOVR) aborts the private read: drop the
 		 * rest of the reply and release it, the controller retries at its own level.
@@ -2659,12 +2790,32 @@ static void i3c_stm32_tx_rx_msg_config(const struct device *dma_dev, void *user_
 static void i3c_stm32_dma_tx_cb(const struct device *dma_dev, void *user_data, uint32_t channel,
 				int status)
 {
+#ifdef CONFIG_I3C_TARGET
+	const struct device *dev = (const struct device *)user_data;
+	const struct i3c_stm32_config *config = dev->config;
+
+	/* A target reply ends with its private read (frame complete), not when the DMA has
+	 * loaded the last byte into the FIFO
+	 */
+	if (!ll_i3c_is_in_controller_mode(config->i3c)) {
+		return;
+	}
+#endif /* CONFIG_I3C_TARGET */
 	i3c_stm32_tx_rx_msg_config(dma_dev, user_data, channel, status);
 }
 
 static void __maybe_unused i3c_stm32_dma_rx_cb(const struct device *dma_dev, void *user_data, uint32_t channel,
 				int status)
 {
+#ifdef CONFIG_I3C_TARGET
+	const struct device *dev = (const struct device *)user_data;
+	const struct i3c_stm32_config *config = dev->config;
+
+	/* A target write ends at frame complete */
+	if (!ll_i3c_is_in_controller_mode(config->i3c)) {
+		return;
+	}
+#endif /* CONFIG_I3C_TARGET */
 	i3c_stm32_tx_rx_msg_config(dma_dev, user_data, channel, status);
 }
 
@@ -2685,6 +2836,12 @@ static int i3c_stm32_target_register(const struct device *dev, struct i3c_target
 	struct i3c_stm32_data *data = dev->data;
 
 	data->target_config = cfg;
+#if defined(CONFIG_I3C_STM32_DMA) && defined(CONFIG_I3C_TARGET_BUFFER_MODE)
+	if (data->dma_rx.dma_dev != NULL && cfg != NULL && cfg->callbacks != NULL &&
+	    cfg->callbacks->buf_write_received_cb != NULL) {
+		(void)i3c_stm32_target_rx_dma_arm(dev);
+	}
+#endif /* CONFIG_I3C_STM32_DMA && CONFIG_I3C_TARGET_BUFFER_MODE */
 	return 0;
 }
 
@@ -2731,9 +2888,28 @@ static int i3c_stm32_target_tx_write(const struct device *dev, uint8_t *buf, uin
 		return -EBUSY;
 	}
 
-	data->target_tx_remaining = len;
 	data->target_tx_len = len;
 	data->target_tx_idx = 0U;
+#ifdef CONFIG_I3C_STM32_DMA
+	if (buf != NULL && data->dma_tx.dma_dev != NULL) {
+		int ret;
+
+		/* The DMA feeds the FIFO: keep the TXFNF interrupt out of it */
+		LL_I3C_DisableIT_TXFNF(i3c);
+		data->target_tx_buf = NULL;
+		data->target_tx_preloaded = false;
+		data->target_tx_remaining = 0U;
+		LL_I3C_ConfigTxPreload(i3c, len);
+		ret = i3c_stm32_target_tx_dma_start(dev, buf, len);
+		if (ret != 0) {
+			LL_I3C_RequestTxFIFOFlush(i3c);
+			data->target_tx_len = 0U;
+		}
+		k_mutex_unlock(&data->bus_mutex);
+		return ret;
+	}
+#endif /* CONFIG_I3C_STM32_DMA */
+	data->target_tx_remaining = len;
 	data->target_tx_buf = buf;
 	data->target_tx_preloaded = true;
 	LL_I3C_ConfigTxPreload(i3c, len);
